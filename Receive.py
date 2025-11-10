@@ -1,9 +1,9 @@
 # mediapipe_receive_touch_fixed.py
 import socket
-import cv2
-import numpy as np
+import cv2 # type: ignore
+import numpy as np # type: ignore
 import struct
-import mediapipe as mp
+import mediapipe as mp # type: ignore
 import threading
 
 HOST = '127.0.0.1'
@@ -15,7 +15,17 @@ latest_depth = None
 lock = threading.Lock()
 running = True
 
-TOUCH_THRESHOLD = 25  # adjust based on depth units
+# --- Hand-to-body contact detection with side-awareness ---
+contact_detected = False
+
+# Threshold map for different contact regions
+THRESHOLD_MAP = {
+    "hand_to_hand": 10,
+    "hand_to_face": 25,
+    "hand_to_torso": 40,
+    "hand_to_leg": 35,
+}
+TOUCH_THRESHOLD = 25
 
 # --- Key joints for detection ---
 BODY_JOINTS = [
@@ -149,19 +159,111 @@ def main():
                         hand_joints.append((hx, hy, hz))
 
             # --- Hand-to-body contact detection ---
+            # Get pose landmarks for later reference
             contact_detected = False
-            for hx, hy, hz in hand_joints:
-                for bx, by, bz in body_joints:
-                    dx = hx - bx
-                    dy = hy - by
-                    dz = int(hz) - int(bz)
-                    dist = np.sqrt(dx**2 + dy**2 + dz**2)
-                    if dist < TOUCH_THRESHOLD:
-                        contact_detected = True
-                        cv2.circle(color_frame, (hx, hy), 10, (0,0,255), -1)
+            pose_landmarks = results_pose.pose_landmarks.landmark if results_pose.pose_landmarks else None
+
+            # Determine handedness info from Mediapipe
+            hand_sides = []  # e.g., ["Left", "Right"]
+            if results_hands.multi_handedness:
+                for handedness in results_hands.multi_handedness:
+                    hand_sides.append(handedness.classification[0].label)  # "Left" or "Right"
+
+            # Iterate through each detected hand
+            if results_hands.multi_hand_landmarks:
+                for i, hand_landmarks in enumerate(results_hands.multi_hand_landmarks):
+                    hand_side = hand_sides[i] if i < len(hand_sides) else "Unknown"
+
+                    for joint in HAND_JOINTS:
+                        lm = hand_landmarks.landmark[joint]
+                        hx, hy, hz = get_pixel_depth(lm, w, h, depth_resized)
+
+                        # Compare this hand joint with each body joint
+                        for bj, (bx, by, bz) in zip(BODY_JOINTS, body_joints):
+                            joint_name = mp_pose.PoseLandmark(bj).name.lower()
+
+                            # Skip self-contact (e.g. left hand vs left wrist/shoulder/hip)
+                            if hand_side == "Left" and "left" in joint_name:
+                                continue
+                            if hand_side == "Right" and "right" in joint_name:
+                                continue
+
+                            # Choose threshold dynamically
+                            if "shoulder" in joint_name or "chest" in joint_name:
+                                threshold = THRESHOLD_MAP["hand_to_torso"]
+                            elif "hip" in joint_name or "waist" in joint_name:
+                                threshold = THRESHOLD_MAP["hand_to_leg"]
+                            elif "nose" in joint_name or "face" in joint_name or "ear" in joint_name:
+                                threshold = THRESHOLD_MAP["hand_to_face"]
+                            elif "wrist" in joint_name or "hand" in joint_name:
+                                threshold = THRESHOLD_MAP["hand_to_hand"]
+                            else:
+                                threshold = TOUCH_THRESHOLD
+
+                            # Calculate distance
+                            dx = hx - bx
+                            dy = hy - by
+                            dz = int(hz) - int(bz)
+                            dist = np.sqrt(dx**2 + dy**2 + dz**2)
+
+                            # Detect contact
+                            if dist < threshold:
+                                contact_detected = True
+                                cv2.circle(color_frame, (hx, hy), 10, (0,0,255), -1)
+                                cv2.putText(color_frame, f"{hand_side} hand touching body!", (50, 50),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
+                                break
+                        if contact_detected:
+                            break
+                    if contact_detected:
                         break
-                if contact_detected:
-                    break
+
+            # --- Stomach region detection ---
+            if results_pose.pose_landmarks:
+                lm = results_pose.pose_landmarks.landmark
+                ls = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
+                rs = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+                lh = lm[mp_pose.PoseLandmark.LEFT_HIP]
+                rh = lm[mp_pose.PoseLandmark.RIGHT_HIP]
+
+                # Convert normalized coords to pixel positions
+                def to_px(lm):
+                    x = int(lm.x * w)
+                    y = int(lm.y * h)
+                    z = depth_resized[y, x] if 0 <= y < h and 0 <= x < w else 0
+                    return (x, y, z)
+
+                left_shoulder = to_px(ls)
+                right_shoulder = to_px(rs)
+                left_hip = to_px(lh)
+                right_hip = to_px(rh)
+
+                # Define quadrilateral for stomach area
+                stomach_polygon = np.array([
+                    [left_shoulder[0], left_shoulder[1]],
+                    [right_shoulder[0], right_shoulder[1]],
+                    [right_hip[0], right_hip[1]],
+                    [left_hip[0], left_hip[1]]
+                ])
+
+                # Optional visualization
+                cv2.polylines(color_frame, [stomach_polygon], True, (255, 255, 0), 2)
+
+                # --- Hand to stomach contact detection ---
+                for hx, hy, hz in hand_joints:
+                    # Check if (hx, hy) is inside stomach polygon
+                    inside = cv2.pointPolygonTest(stomach_polygon, (hx, hy), False)
+                    if inside >= 0:
+                        # Check approximate depth proximity
+                        stomach_depths = [left_shoulder[2], right_shoulder[2], left_hip[2], right_hip[2]]
+                        avg_stomach_depth = np.mean(stomach_depths)
+                        if abs(int(hz) - int(avg_stomach_depth)) < TOUCH_THRESHOLD:
+                            contact_detected = True
+                            cv2.circle(color_frame, (hx, hy), 12, (0, 255, 255), -1)
+                            cv2.putText(color_frame, "HAND TOUCHING STOMACH!", (50,100),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,255), 2)
+                            break
+
 
             if contact_detected:
                 cv2.putText(color_frame, "HAND TOUCHING BODY!", (50,50),
