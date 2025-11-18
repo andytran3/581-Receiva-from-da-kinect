@@ -5,9 +5,14 @@ import numpy as np # type: ignore
 import struct
 import mediapipe as mp # type: ignore
 import threading
+import serial.tools.list_ports
+import serial
 
 HOST = '127.0.0.1'
 PORT = 5001
+
+# reading from IMU
+BAUD_RATE = 115200
 
 # Shared frames and lock
 latest_color = None
@@ -41,6 +46,45 @@ HAND_JOINTS = [
     mp.solutions.hands.HandLandmark.INDEX_FINGER_TIP,
     mp.solutions.hands.HandLandmark.MIDDLE_FINGER_TIP
 ]
+
+FINGER_TIPS = [
+    mp.solutions.HandLandmark.THUMB_TIP,
+    mp.solutions.HandLandmark.INDEX_FINGER_TIP,
+    mp.solutions.HandLandmark.MIDDLE_FINGER_TIP,
+    mp.solutions.HandLandmark.RING_FINGER_TIP,
+    mp.solutions.HandLandmark.PINKY_TIP
+]
+
+
+def find_usb_serial_port():
+    ports = serial.tools.list_ports.comports()
+
+    for port in ports:
+        desc = port.description.lower()
+
+        if "usb serial port" in desc:
+            return port.device
+
+    print("Arduino not found.")
+    return None
+
+def read_serial():
+    SERIAL_PORT = find_usb_serial_port()
+    if SERIAL_PORT is None:
+        print("No Arduino found.")
+        return
+
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+
+    while running:
+        try:
+            cur = ser.readline().decode(errors="ignore").strip()
+            if cur:
+                print("[SERIAL]", cur)
+        except Exception as e:
+            break
+
+    ser.close()
 
 # ----------------- Utilities -----------------
 def recvall(sock, n):
@@ -108,7 +152,9 @@ def main():
     print(f"Connected to {addr}")
 
     recv_thread = threading.Thread(target=receive_frames, args=(conn,), daemon=True)
+    serial_thread = threading.Thread(target=read_serial, daemon=True)
     recv_thread.start()
+    serial_thread.start()
 
     try:
         while running:
@@ -174,21 +220,24 @@ def main():
                 for i, hand_landmarks in enumerate(results_hands.multi_hand_landmarks):
                     hand_side = hand_sides[i] if i < len(hand_sides) else "Unknown"
 
-                    for joint in HAND_JOINTS:
-                        lm = hand_landmarks.landmark[joint]
+                    # Check each fingertip instead of every joint
+                    for tip in FINGER_TIPS:
+                        lm = hand_landmarks.landmark[tip]
                         hx, hy, hz = get_pixel_depth(lm, w, h, depth_resized)
 
-                        # Compare this hand joint with each body joint
+                        fingertip_name = mp_hands.HandLandmark(tip).name.lower()
+
+                        # Compare fingertip with all body joints
                         for bj, (bx, by, bz) in zip(BODY_JOINTS, body_joints):
                             joint_name = mp_pose.PoseLandmark(bj).name.lower()
 
-                            # Skip self-contact (e.g. left hand vs left wrist/shoulder/hip)
+                            # Skip same-side self-contact
                             if hand_side == "Left" and "left" in joint_name:
                                 continue
                             if hand_side == "Right" and "right" in joint_name:
                                 continue
 
-                            # Choose threshold dynamically
+                            # Dynamic threshold selection
                             if "shoulder" in joint_name or "chest" in joint_name:
                                 threshold = THRESHOLD_MAP["hand_to_torso"]
                             elif "hip" in joint_name or "waist" in joint_name:
@@ -200,23 +249,29 @@ def main():
                             else:
                                 threshold = TOUCH_THRESHOLD
 
-                            # Calculate distance
+                            # Distance calculation
                             dx = hx - bx
                             dy = hy - by
                             dz = int(hz) - int(bz)
                             dist = np.sqrt(dx**2 + dy**2 + dz**2)
 
-                            # Detect contact
+                            # Contact detected for THIS fingertip
                             if dist < threshold:
                                 contact_detected = True
-                                cv2.circle(color_frame, (hx, hy), 10, (0,0,255), -1)
-                                cv2.putText(color_frame, f"{hand_side} hand touching body!", (50, 50),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 2)
-                                break
+
+                                cv2.circle(color_frame, (hx, hy), 10, (0, 0, 255), -1)
+                                cv2.putText(color_frame,
+                                            f"{hand_side} {fingertip_name} touching {joint_name}",
+                                            (50, 50),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+                                break  # stop checking other body joints
+
                         if contact_detected:
-                            break
+                            break  # stop checking other fingertips
+
                     if contact_detected:
-                        break
+                        break  # stop checking other hands
 
             # --- Stomach region detection ---
             if results_pose.pose_landmarks:
