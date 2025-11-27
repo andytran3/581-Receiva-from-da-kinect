@@ -8,9 +8,12 @@
 // Map TCA channels to fingers
 const uint8_t fingerChannel[5] = {6, 5, 4, 3, 2}; 
 const char* fingerName[5] = {"Thumb", "Index", "Middle", "Ring", "Pinky"};
+bool prevTouchState[5] = {false, false, false, false, false};
+bool tapInProgress[5] = {false};
 
 // Touch sensor pins (TTP223)
-const uint8_t touchPin[5] = {6, 5, 4, 3, 2};  
+const uint8_t touchPin[5] = {4};
+//{11, 10, 9, 8, 7};  
 
 // Tap detection parameters
 const float TAP_THRESHOLD = 2.0;      // Acceleration magnitude threshold for detecting taps (in g)
@@ -100,6 +103,7 @@ void readIMU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
   gz = rawGz / 131.0;
 }
 
+
 // Setup function runs once
 void setup() {
   Serial.begin(115200);  // Initialize serial output
@@ -108,7 +112,7 @@ void setup() {
 
   // Configure touch sensor pins
   for (int i = 0; i < 5; i++) {
-    pinMode(touchPin[i], INPUT);  // TTP223 touch sensors are digital inputs
+    pinMode(touchPin[i], INPUT_PULLUP);  // TTP223 touch sensors are digital inputs
   }
 
   // Wake up all IMUs
@@ -125,18 +129,10 @@ void loop() {
   unsigned long now = micros();  // Current time in microseconds
 
   // Loop over each finger
-  for (uint8_t i = 0; i < 5; i++) {
+  for (uint8_t i = 0; i < 1; i++) {
 
     // 1. Read touch sensor
     bool touched = (digitalRead(touchPin[i]) == HIGH);
-
-       // --- Detect touch release ---
-    if (prevTouchState[i] && !touched) {  // previously touched, now not touched
-      Serial.print(fingerName[i]);
-      Serial.println(" finger lifted");
-    }
-
-    prevTouchState[i] = touched;
 
     // 2. Read accelerometer magnitude for tap detection
     tcaSelect(fingerChannel[i]);  
@@ -146,17 +142,40 @@ void loop() {
     readIMU(ax, ay, az, gx, gy, gz);
 
     // 3. Detect tap
-    float mag = readAccelMagnitude();
+    float mag = sqrt(ax*ax + ay*ay + az*az);
     bool imuTap = (mag > TAP_THRESHOLD);  
     bool debounceOK = (now - lastTapTime[i] > DEBOUNCE_US);
+  
+    // Serial.print("PIN ");
+    // Serial.print(touchPin[i]);
+    // Serial.print(": ");
+    // Serial.println(digitalRead(touchPin[i]));
+    // Serial.println(touched);
+    // Serial.print("IMU TAP: ");
+    // if (imuTap == 1) {
+    //    Serial.println(imuTap);
+    // }
+    // Serial.print("DEBOUNCE: ");
 
     if (touched && imuTap && debounceOK) {
       Serial.print(fingerName[i]);
-      Serial.print(" finger tapped at ");
-      Serial.print(now);
-      Serial.println(" us");
+      Serial.println(" finger tapped");
+      // Serial.print(now);
+      // Serial.println(" us");
       lastTapTime[i] = now;  // Update last tap time
+      // tapInProgress[i] = true;
     }
+
+           // --- Detect touch release ---
+    if (prevTouchState[i] && !touched) {  // previously touched, now not touched
+      Serial.print(fingerName[i]);
+      Serial.println(" finger lifted");
+      // tapInProgress[i] = false;  // reset
+    }
+
+    prevTouchState[i] = touched;
+
+    // delay(200);
 
     // ---- SLIDER DETECTION ----
     // detectSlider(i, touched, gx, now);
