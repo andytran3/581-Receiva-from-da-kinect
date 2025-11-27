@@ -130,6 +130,14 @@ void loop() {
     // 1. Read touch sensor
     bool touched = (digitalRead(touchPin[i]) == HIGH);
 
+       // --- Detect touch release ---
+    if (prevTouchState[i] && !touched) {  // previously touched, now not touched
+      Serial.print(fingerName[i]);
+      Serial.println(" finger lifted");
+    }
+
+    prevTouchState[i] = touched;
+
     // 2. Read accelerometer magnitude for tap detection
     tcaSelect(fingerChannel[i]);  
     delayMicroseconds(200);       // Small settle delay
