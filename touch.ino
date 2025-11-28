@@ -12,13 +12,25 @@ bool prevTouchState[5] = {false, false, false, false, false};
 bool tapInProgress[5] = {false};
 
 // Touch sensor pins (TTP223)
-const uint8_t touchPin[5] = {4};
-//{11, 10, 9, 8, 7};  
+const uint8_t touchPin[5] = {11, 10, 9, 8, 7};  
 
 // Tap detection parameters
-const float TAP_THRESHOLD = 2.0;      // Acceleration magnitude threshold for detecting taps (in g)
+bool imuTapDetected[5] = {false};
+unsigned long imuTapTime[5] = {0};
+
+
+const float fingerThreshold[5] = {
+    1.15, // Thumb
+    1.4,  // Index
+    1.5,  // Middle
+    1.5,  // Ring
+    1.10  // Pinky
+};
+
 const unsigned long DEBOUNCE_US = 50; // simple debounce
 unsigned long lastTapTime[5] = {0, 0, 0, 0, 0}; // Store last tap time for each finger
+
+bool tappedActive[5];
 
 // Slide detection tuning paramters 
 const float SLIDE_ACCEL_LOW = 0.85;              // lower bound of acceleration magnitude near 1g
@@ -26,6 +38,11 @@ const float SLIDE_ACCEL_HIGH = 1.25;             // upper bound of acceleration 
 const float SLIDE_GYRO_THRESHOLD = 10;           // deg/sec minimal sliding rotation
 const unsigned long SLIDE_MIN_DURATION = 20000;  // 20ms to confirm slide
 const unsigned long SLIDE_TIMEOUT = 150000;      // 150ms without motion → stop
+
+// --- LOOP STATE ---
+uint8_t currentIMU = 0;          // Which IMU to read this loop
+unsigned long lastIMURead = 0;   // Timing for IMU cycle
+const unsigned long IMU_INTERVAL_US = 6000;  // Read one IMU every 8 ms
 
 // ---- SLIDER VARIABLES ----
 bool sliding[5] = {false, false, false, false, false};
@@ -108,11 +125,12 @@ void readIMU(float &ax, float &ay, float &az, float &gx, float &gy, float &gz) {
 void setup() {
   Serial.begin(115200);  // Initialize serial output
   Wire.begin();           // Initialize I2C
+  Wire.setWireTimeout(3000, true);
   delay(1000);            // Small delay for stabilization
 
   // Configure touch sensor pins
   for (int i = 0; i < 5; i++) {
-    pinMode(touchPin[i], INPUT_PULLUP);  // TTP223 touch sensors are digital inputs
+    pinMode(touchPin[i], INPUT);  // TTP223 touch sensors are digital inputs
   }
 
   // Wake up all IMUs
@@ -124,63 +142,82 @@ void setup() {
   Serial.println("5-finger tap detection started!");
 }
 
-// Loop function runs continuously
 void loop() {
-  unsigned long now = micros();  // Current time in microseconds
+    unsigned long now = micros();
 
-  // Loop over each finger
-  for (uint8_t i = 0; i < 1; i++) {
+    // -------------------------------
+    // FAST LOOP (runs every iteration)
+    // Reads touch sensors instantly
+    // -------------------------------
+    for (uint8_t i = 0; i < 5; i++) {
+        bool touched = (digitalRead(touchPin[i]) == HIGH);
+        bool wasTouched = prevTouchState[i];
 
-    // 1. Read touch sensor
-    bool touched = (digitalRead(touchPin[i]) == HIGH);
+        // LIFT DETECTION (only if previously tapped)
+        if (tappedActive[i] && !touched) {
+            Serial.print(fingerName[i]);
+            Serial.println(" finger lifted");
 
-    // 2. Read accelerometer magnitude for tap detection
-    tcaSelect(fingerChannel[i]);  
-    delayMicroseconds(200);       // Small settle delay
+            tappedActive[i] = false;    // Reset state
+            // Serial.println(tappedActive[i]);
+        }
 
-    float ax, ay, az, gx, gy, gz;
-    readIMU(ax, ay, az, gx, gy, gz);
+        // ---- Detect tap (requires IMU tap window set by slow loop) ----
+        bool debounceOK = (now - lastTapTime[i] > DEBOUNCE_US);
 
-    // 3. Detect tap
-    float mag = sqrt(ax*ax + ay*ay + az*az);
-    bool imuTap = (mag > TAP_THRESHOLD);  
-    bool debounceOK = (now - lastTapTime[i] > DEBOUNCE_US);
-  
-    // Serial.print("PIN ");
-    // Serial.print(touchPin[i]);
-    // Serial.print(": ");
-    // Serial.println(digitalRead(touchPin[i]));
-    // Serial.println(touched);
-    // Serial.print("IMU TAP: ");
-    // if (imuTap == 1) {
-    //    Serial.println(imuTap);
-    // }
-    // Serial.print("DEBOUNCE: ");
+        // TAP DETECTION
+        if (!tappedActive[i] && touched && imuTapDetected[i] && debounceOK) {
+            Serial.print(fingerName[i]);
+            Serial.println(" finger tapped");
+            tappedActive[i] = true;     // Now the finger is in a "tapped" state
+            // Serial.println(tappedActive[i]);
+            lastTapTime[i] = now;
+        }
 
-    if (touched && imuTap && debounceOK) {
-      Serial.print(fingerName[i]);
-      Serial.println(" finger tapped");
-      // Serial.print(now);
-      // Serial.println(" us");
-      lastTapTime[i] = now;  // Update last tap time
-      // tapInProgress[i] = true;
+
+        prevTouchState[i] = touched;
     }
 
-           // --- Detect touch release ---
-    if (prevTouchState[i] && !touched) {  // previously touched, now not touched
-      Serial.print(fingerName[i]);
-      Serial.println(" finger lifted");
-      // tapInProgress[i] = false;  // reset
+    // -------------------------------------------------
+    // SLOW LOOP (runs every 3 ms)
+    // Reads ONE IMU each cycle
+    // -------------------------------------------------
+    if (now - lastIMURead >= IMU_INTERVAL_US) {
+        lastIMURead = now;
+
+        // Select next IMU
+        uint8_t i = currentIMU;
+
+        tcaSelect(fingerChannel[i]);
+        
+        float ax, ay, az, gx, gy, gz;
+        readIMU(ax, ay, az, gx, gy, gz);
+
+        // ---- TAP DETECTION ----
+        float mag = sqrt(ax*ax + ay*ay + az*az);
+
+        // if (i == 4 && mag > 1.15) {
+        //   Serial.print(" mag=");
+        //   Serial.println(mag);
+        // }
+
+        if (mag > fingerThreshold[i]) {
+            imuTapDetected[i] = true;
+            imuTapTime[i] = now;
+        }
+
+        if (now - imuTapTime[i] > 90000) {  // 90 ms tap window
+            imuTapDetected[i] = false;
+        }
+
+        // Optionally use gyro for slide
+        // detectSlider(i, prevTouchState[i], gx, now);
+
+        // Next IMU for next cycle
+        currentIMU = (currentIMU + 1) % 5;
     }
-
-    prevTouchState[i] = touched;
-
-    // delay(200);
-
-    // ---- SLIDER DETECTION ----
-    // detectSlider(i, touched, gx, now);
-  }
 }
+
 
 bool detectSlider(int finger, bool touched, float gx, unsigned long now) {
 
