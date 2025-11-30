@@ -17,7 +17,7 @@ latest_depth = None
 lock = threading.Lock()
 running = True
 
-DEPTH_THRESHOLD = 30  # You can tweak this
+DEPTH_THRESHOLD = 140  # You can tweak this
 
 # Touch state per finger (from Arduino)
 touch_state = {
@@ -73,7 +73,7 @@ def read_serial():
                     if "lifted" in line_lower:
                         touch_state[fingertip_key] = False
                     break
-            print(touch_state)
+            # print(touch_state)
         except Exception as e:
             print("Serial error:", e)
             break
@@ -125,8 +125,29 @@ def get_pixel_depth(lm, color_w, color_h, depth_frame):
     y_d = int(y_c * depth_h / color_h)
     if x_d < 0 or x_d >= depth_w or y_d < 0 or y_d >= depth_h:
         return None
-    z = float(depth_frame[y_d, x_d])
+    z = get_stable_depth(depth_frame, x_d, y_d, window=7)
+    if z is None:
+        return None
     return x_c, y_c, z
+
+def get_stable_depth(depth_frame, x, y, window=7):
+    h, w = depth_frame.shape
+    half = window // 2
+
+    xs = range(max(0, x-half), min(w, x+half+1))
+    ys = range(max(0, y-half), min(h, y+half+1))
+
+    samples = []
+    for yy in ys:
+        for xx in xs:
+            d = depth_frame[yy, xx]
+            if d > 0:              # ignore invalid
+                samples.append(d)
+
+    if len(samples) == 0:
+        return None               # no valid depth nearby
+
+    return np.median(samples)     # stable depth
 
 def compute_body_positions(results_pose, color_w, color_h, depth_frame):
     positions = {}
@@ -179,21 +200,30 @@ def check_wrist_contact(wx, wy, wz, hand_side, stomach_polygon, stomach_depth):
         return True, f"{hand_side} wrist near torso & finger pressed"
     return False, None
 
-# ---------------- Wrist Processing -----------------
-def process_wrists(results_pose, stomach_polygon, stomach_depth, color_frame):
+# ---------------- Physical Right Wrist Processing (with coords print) -----------------
+def process_physical_right_wrist(results_pose, stomach_polygon, stomach_depth, color_frame):
     contact_detected = False
-    wrist_positions = []
+    wrist_position = None
 
     if results_pose.pose_landmarks:
         lm = results_pose.pose_landmarks.landmark
-        for side in ["RIGHT_WRIST", "LEFT_WRIST"]:
-            wrist_lm = lm[getattr(mp.solutions.pose.PoseLandmark, side)]
-            xyz = get_pixel_depth(wrist_lm, color_frame.shape[1], color_frame.shape[0], latest_depth)
-            if xyz is None:
-                continue
+        # MediaPipe LEFT_WRIST = physical right wrist (if mirrored)
+        wrist_lm = lm[mp.solutions.pose.PoseLandmark.LEFT_WRIST]
+        xyz = get_pixel_depth(wrist_lm, color_frame.shape[1], color_frame.shape[0], latest_depth)
+        if xyz is not None:
             wx, wy, wz = xyz
-            wrist_positions.append((wx, wy, wz))
-            hand_side = "Left" if "LEFT" in side else "Right"
+            wrist_position = (wx, wy, wz)
+            hand_side = "Right"
+
+            # Print wrist coordinates
+            print(f"[DEBUG] {hand_side} wrist coords: x={wx}, y={wy}, z={wz}")
+
+            # Print torso polygon coordinates
+            if stomach_polygon is not None:
+                print("[DEBUG] Torso polygon points:")
+                for i, point in enumerate(stomach_polygon):
+                    print(f"  Point {i}: x={point[0]}, y={point[1]}")
+                print(f"[DEBUG] Torso avg depth: {stomach_depth}")
 
             contact, msg = check_wrist_contact(wx, wy, wz, hand_side, stomach_polygon, stomach_depth)
             if contact:
@@ -209,7 +239,10 @@ def process_wrists(results_pose, stomach_polygon, stomach_depth, color_frame):
                 cv2.putText(color_frame, hand_side + " wrist", (wx + 10, wy - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-    return contact_detected, wrist_positions
+    return contact_detected, wrist_position
+
+
+
 
 # ---------------- Main -----------------
 def main():
@@ -249,7 +282,10 @@ def main():
             if stomach_polygon is not None:
                 cv2.polylines(color_frame, [stomach_polygon], True, (255, 255, 0), 2)
 
-            process_wrists(results_pose, stomach_polygon, stomach_depth, color_frame)
+            contact_detected, right_wrist_pos = process_physical_right_wrist(
+                results_pose, stomach_polygon, stomach_depth, color_frame
+            )
+
 
             # Depth visualization
             depth_vis = cv2.normalize(depth_resized, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
