@@ -17,7 +17,7 @@ latest_depth = None
 lock = threading.Lock()
 running = True
 
-DEPTH_THRESHOLD = 140  # You can tweak this
+DEPTH_THRESHOLD = 200  # You can tweak this
 
 # Touch state per finger (from Arduino)
 touch_state = {
@@ -73,7 +73,7 @@ def read_serial():
                     if "lifted" in line_lower:
                         touch_state[fingertip_key] = False
                     break
-            # print(touch_state)
+            print(touch_state)
         except Exception as e:
             print("Serial error:", e)
             break
@@ -83,36 +83,51 @@ def read_serial():
 def recvall(sock, n):
     buf = b''
     while len(buf) < n:
-        data = sock.recv(n - len(buf))
+        try:
+            data = sock.recv(n - len(buf))
+        except Exception as e:
+            print("Socket recv error:", e)
+            return None
         if not data:
+            # Connection closed
             return None
         buf += data
     return buf
+
 
 def receive_frames(conn):
     global latest_color, latest_depth, running
     while running:
         frame_type = recvall(conn, 1)
         if not frame_type:
+            print("Frame type not received, stopping receive thread.")
             running = False
             break
+
         raw_len = recvall(conn, 4)
         if not raw_len:
+            print("Frame length not received, stopping receive thread.")
             running = False
             break
+
         length = struct.unpack(">L", raw_len)[0]
         data = recvall(conn, length)
         if not data:
+            print("Frame data incomplete, stopping receive thread.")
             running = False
             break
+
         if frame_type == b'C':
             frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-            with lock:
-                latest_color = frame
+            if frame is not None:
+                with lock:
+                    latest_color = frame
         elif frame_type == b'D':
             frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
-            with lock:
-                latest_depth = frame
+            if frame is not None:
+                with lock:
+                    latest_depth = frame
+
 
 # ---------------- Utilities -----------------
 def get_pixel_depth(lm, color_w, color_h, depth_frame):
@@ -181,35 +196,148 @@ def compute_stomach_polygon(results_pose, color_w, color_h, depth_frame):
     avg_depth = np.mean([left_shoulder[2], right_shoulder[2], left_hip[2], right_hip[2]])
     return polygon, avg_depth
 
+def compute_head_position(results_pose, color_w, color_h, depth_frame):
+    if not results_pose.pose_landmarks:
+        return None, None
+    lm = results_pose.pose_landmarks.landmark
+    try:
+        nose = get_pixel_depth(lm[mp.solutions.pose.PoseLandmark.NOSE], color_w, color_h, depth_frame)
+        left_ear = get_pixel_depth(lm[mp.solutions.pose.PoseLandmark.LEFT_EAR], color_w, color_h, depth_frame)
+        right_ear = get_pixel_depth(lm[mp.solutions.pose.PoseLandmark.RIGHT_EAR], color_w, color_h, depth_frame)
+        if None in (nose, left_ear, right_ear):
+            return None, None
+    except Exception:
+        return None, None
+
+    polygon = np.array([
+        [left_ear[0], left_ear[1]],
+        [right_ear[0], right_ear[1]],
+        [nose[0], nose[1]]
+    ])
+    avg_depth = np.mean([nose[2], left_ear[2], right_ear[2]])
+    return polygon, avg_depth
+
+def compute_shoulders_polygon(results_pose, color_w, color_h, depth_frame):
+    if not results_pose.pose_landmarks:
+        return None, None
+    lm = results_pose.pose_landmarks.landmark
+    try:
+        left_shoulder = get_pixel_depth(lm[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER], color_w, color_h, depth_frame)
+        right_shoulder = get_pixel_depth(lm[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER], color_w, color_h, depth_frame)
+        if None in (left_shoulder, right_shoulder):
+            return None, None
+    except Exception:
+        return None, None
+
+    polygon = np.array([
+        [left_shoulder[0], left_shoulder[1]],
+        [right_shoulder[0], right_shoulder[1]]
+    ])
+    avg_depth = np.mean([left_shoulder[2], right_shoulder[2]])
+    return polygon, avg_depth
+
+def compute_arm_polygon(results_pose, color_w, color_h, depth_frame, side="Left"):
+    """
+    Compute a polygon from wrist → elbow → shoulder for one arm.
+    side: "Left" or "Right" (physical sides, mirrored if needed)
+    Returns: polygon (4 points) and average depth
+    """
+    if not results_pose.pose_landmarks:
+        return None, None
+
+    lm = results_pose.pose_landmarks.landmark
+
+    # Map physical side to MediaPipe joints (mirrored feed)
+    if side == "Left":
+        wrist_lm = lm[mp.solutions.pose.PoseLandmark.RIGHT_WRIST]
+        elbow_lm = lm[mp.solutions.pose.PoseLandmark.RIGHT_ELBOW]
+        shoulder_lm = lm[mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER]
+    else:
+        wrist_lm = lm[mp.solutions.pose.PoseLandmark.LEFT_WRIST]
+        elbow_lm = lm[mp.solutions.pose.PoseLandmark.LEFT_ELBOW]
+        shoulder_lm = lm[mp.solutions.pose.PoseLandmark.LEFT_SHOULDER]
+
+    wrist = get_pixel_depth(wrist_lm, color_w, color_h, depth_frame)
+    elbow = get_pixel_depth(elbow_lm, color_w, color_h, depth_frame)
+    shoulder = get_pixel_depth(shoulder_lm, color_w, color_h, depth_frame)
+
+    if None in (wrist, elbow, shoulder):
+        return None, None
+
+    # Compute a simple "arm polygon" using the 3 points
+    # We'll make it a quadrilateral by offsetting slightly along X or Y if needed
+    polygon = np.array([
+        [wrist[0], wrist[1]],
+        [elbow[0], elbow[1]],
+        [shoulder[0], shoulder[1]],
+        [elbow[0], elbow[1]]  # duplicate elbow to make quad for simplicity
+    ])
+
+    avg_depth = np.mean([wrist[2], elbow[2], shoulder[2]])
+    return polygon, avg_depth
+
+
 # ---------------- Wrist Contact Check -----------------
-def check_wrist_contact(wx, wy, wz, hand_side, stomach_polygon, stomach_depth):
+def check_wrist_contact(wx, wy, wz, hand_side, polygons_with_depths):
     """
     Returns True if:
-        - Wrist is inside torso polygon (XY)
-        - Wrist depth is near torso depth (Z)
+        - Wrist is inside any polygon (XY)
+        - Wrist depth is near that polygon's depth (Z)
         - Any finger is pressed
+    polygons_with_depths: list of tuples [(polygon, avg_depth, name_str), ...]
     """
     if not any(touch_state.values()):
         return False, None
-    if stomach_polygon is None or stomach_depth is None:
-        return False, None
-    inside = cv2.pointPolygonTest(stomach_polygon, (wx, wy), False)
-    if inside < 0:
-        return False, None
-    if abs(wz - stomach_depth) <= DEPTH_THRESHOLD:
-        return True, f"{hand_side} wrist near torso & finger pressed"
+
+    for poly, poly_depth, name in polygons_with_depths:
+        if poly is None or poly_depth is None:
+            continue
+        inside = cv2.pointPolygonTest(poly, (wx, wy), False)
+        if inside >= 0 and abs(wz - poly_depth) <= DEPTH_THRESHOLD:
+            return True, f"{hand_side} wrist near {name} & finger pressed"
+
     return False, None
 
+
 # ---------------- Physical Right Wrist Processing (with coords print) -----------------
-def process_physical_right_wrist(results_pose, stomach_polygon, stomach_depth, color_frame):
+
+def get_wrist_palm_xyz(lm,color_w, color_h, depth_frame, scale=-0.5):
+    """
+    Returns an adjusted wrist point closer to the palm.
+    scale: fraction along wrist -> middle MCP joint
+    """
+
+    wrist_lm = lm[mp.solutions.pose.PoseLandmark.LEFT_WRIST]  # mirrored
+    elbow_lm = lm[mp.solutions.pose.PoseLandmark.LEFT_ELBOW]
+ 
+    wrist_xyz = get_pixel_depth(wrist_lm, color_w, color_h, depth_frame)
+    elbow_xyz = get_pixel_depth(elbow_lm, color_w, color_h, depth_frame)
+
+    if wrist_xyz is None or elbow_xyz is None:
+        return wrist_xyz  # fallback to wrist if something fails
+
+    # Vector from wrist to elbow
+    vx = elbow_xyz[0] - wrist_xyz[0]
+    vy = elbow_xyz[1] - wrist_xyz[1]
+    vz = elbow_xyz[2] - wrist_xyz[2]
+
+    # Offset point along that vector
+    palm_xyz = (
+        int(wrist_xyz[0] + vx * scale),
+        int(wrist_xyz[1] + vy * scale),
+        wrist_xyz[2] + vz * scale  # optional: adjust depth slightly
+    )
+
+    return palm_xyz
+
+
+def process_physical_right_wrist(results_pose, polygons_list, color_frame):
     contact_detected = False
     wrist_position = None
 
     if results_pose.pose_landmarks:
         lm = results_pose.pose_landmarks.landmark
-        # MediaPipe LEFT_WRIST = physical right wrist (if mirrored)
-        wrist_lm = lm[mp.solutions.pose.PoseLandmark.LEFT_WRIST]
-        xyz = get_pixel_depth(wrist_lm, color_frame.shape[1], color_frame.shape[0], latest_depth)
+        xyz = get_wrist_palm_xyz(lm, color_frame.shape[1], color_frame.shape[0], latest_depth)
         if xyz is not None:
             wx, wy, wz = xyz
             wrist_position = (wx, wy, wz)
@@ -218,14 +346,11 @@ def process_physical_right_wrist(results_pose, stomach_polygon, stomach_depth, c
             # Print wrist coordinates
             print(f"[DEBUG] {hand_side} wrist coords: x={wx}, y={wy}, z={wz}")
 
-            # Print torso polygon coordinates
-            if stomach_polygon is not None:
-                print("[DEBUG] Torso polygon points:")
-                for i, point in enumerate(stomach_polygon):
-                    print(f"  Point {i}: x={point[0]}, y={point[1]}")
-                print(f"[DEBUG] Torso avg depth: {stomach_depth}")
 
-            contact, msg = check_wrist_contact(wx, wy, wz, hand_side, stomach_polygon, stomach_depth)
+            contact, msg = check_wrist_contact(
+                wx, wy, wz, "Right", polygons_list
+            )
+
             if contact:
                 contact_detected = True
                 # Large screen flash
@@ -267,35 +392,65 @@ def main():
                 color_frame = latest_color.copy() if latest_color is not None else None
                 depth_frame = latest_depth.copy() if latest_depth is not None else None
 
+            # Skip iteration if frames aren't ready yet
             if color_frame is None or depth_frame is None:
                 cv2.waitKey(1)
                 continue
 
+            # Prepare frames
             frame_rgb = cv2.cvtColor(color_frame, cv2.COLOR_BGR2RGB)
             depth_resized = cv2.resize(depth_frame, (color_frame.shape[1], color_frame.shape[0]),
                                        interpolation=cv2.INTER_NEAREST)
 
             results_pose = pose.process(frame_rgb)
-            compute_body_positions(results_pose, color_frame.shape[1], color_frame.shape[0], depth_resized)
-            stomach_polygon, stomach_depth = compute_stomach_polygon(results_pose, color_frame.shape[1], color_frame.shape[0], depth_resized)
+
+            # Torso / stomach
+            stomach_polygon, stomach_depth = compute_stomach_polygon(
+                results_pose, color_frame.shape[1], color_frame.shape[0], depth_resized
+            )
+            head_polygon, head_depth = compute_head_position(results_pose, color_frame.shape[1], color_frame.shape[0], depth_resized)
+            shoulders_polygon, shoulders_depth = compute_shoulders_polygon(results_pose, color_frame.shape[1], color_frame.shape[0], depth_resized)
+            right_arm_polygon, right_arm_depth = compute_arm_polygon(results_pose, color_frame.shape[1], color_frame.shape[0], depth_resized, side="Right")
+            left_arm_polygon, left_arm_depth = compute_arm_polygon(results_pose, color_frame.shape[1], color_frame.shape[0], depth_resized, side="Left")
+
+            polygons_list = [
+                (stomach_polygon, stomach_depth, "torso"),
+                (head_polygon, head_depth, "head"),
+                (shoulders_polygon, shoulders_depth, "shoulders"),
+                (right_arm_polygon, right_arm_depth, "right arm"),
+                (left_arm_polygon, left_arm_depth, "left arm")
+            ]
+            
+            print("[DEBUG] Head Depth:", head_depth)
+            print("[DEBUG] shoulders_depth:", shoulders_depth)
+            print("[DEBUG] right_arm_depth:", right_arm_depth)
+            print("[DEBUG] left_arm_depth:", left_arm_depth)
+            print("[DEBUG] stomach depth:", stomach_depth)
 
             if stomach_polygon is not None:
                 cv2.polylines(color_frame, [stomach_polygon], True, (255, 255, 0), 2)
+            if head_polygon is not None:
+                cv2.polylines(color_frame, [head_polygon], True, (0, 255, 255), 2)
+            if shoulders_polygon is not None:
+                cv2.polylines(color_frame, [shoulders_polygon], False, (255, 255, 0), 2)
+            if right_arm_polygon is not None:
+                cv2.polylines(color_frame, [right_arm_polygon], True, (0, 0, 255), 2)
+            if left_arm_polygon is not None:
+                cv2.polylines(color_frame, [left_arm_polygon], True, (0, 255, 0), 2)
 
-            contact_detected, right_wrist_pos = process_physical_right_wrist(
-                results_pose, stomach_polygon, stomach_depth, color_frame
-            )
 
+            process_physical_right_wrist(results_pose, polygons_list, color_frame)
 
             # Depth visualization
             depth_vis = cv2.normalize(depth_resized, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
             depth_vis = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
 
+            # Combine color and depth
             combined = np.hstack((
                 cv2.resize(color_frame, (640, 360)),
                 cv2.resize(depth_vis, (640, 360))
             ))
-            cv2.imshow("RGB + Depth + Wrist Detection", combined)
+            cv2.imshow("RGB + Depth + Body Detection", combined)
 
             if cv2.waitKey(1) & 0xFF == 27:
                 running = False
@@ -306,6 +461,7 @@ def main():
         conn.close()
         sock.close()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
