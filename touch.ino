@@ -18,19 +18,23 @@ const uint8_t touchPin[5] = {11, 10, 9, 8, 7};
 bool imuTapDetected[5] = {false};
 unsigned long imuTapTime[5] = {0};
 
+float prevSliderValue[5] = {0, 0, 0, 0, 0};
+
+int sliderPrintCounter[5] = {0};
 
 const float fingerThreshold[5] = {
     1.15, // Thumb
     1.4,  // Index
     1.5,  // Middle
     1.5,  // Ring
-    1.10  // Pinky
+    0.96  // Pinky
 };
 
 const unsigned long DEBOUNCE_US = 50; // simple debounce
 unsigned long lastTapTime[5] = {0, 0, 0, 0, 0}; // Store last tap time for each finger
 
 bool tappedActive[5];
+int activeSliderFinger = -1; 
 
 // Slide detection tuning paramters 
 const float SLIDE_ACCEL_LOW = 0.85;              // lower bound of acceleration magnitude near 1g
@@ -38,6 +42,9 @@ const float SLIDE_ACCEL_HIGH = 1.25;             // upper bound of acceleration 
 const float SLIDE_GYRO_THRESHOLD = 10;           // deg/sec minimal sliding rotation
 const unsigned long SLIDE_MIN_DURATION = 20000;  // 20ms to confirm slide
 const unsigned long SLIDE_TIMEOUT = 150000;      // 150ms without motion → stop
+const float SLIDE_SMOOTHING = 0.1;  // 0 = no smoothing, 1 = instant jump
+float smoothedMotion[5] = {0,0,0,0,0};
+
 
 // --- LOOP STATE ---
 uint8_t currentIMU = 0;          // Which IMU to read this loop
@@ -211,7 +218,9 @@ void loop() {
         }
 
         // Optionally use gyro for slide
-        // detectSlider(i, prevTouchState[i], gx, now);
+        if (tappedActive[i]) {  // Only detect slider if finger was tapped
+            detectSlider(i, prevTouchState[i], gx, now);
+        }
 
         // Next IMU for next cycle
         currentIMU = (currentIMU + 1) % 5;
@@ -221,10 +230,23 @@ void loop() {
 
 bool detectSlider(int finger, bool touched, float gx, unsigned long now) {
 
+    // --- Check if another finger is currently sliding ---
+    if (activeSliderFinger != -1 && activeSliderFinger != finger) {
+        // Another finger is sliding → ignore this finger
+        sliding[finger] = false;
+        return false;
+    }
+
     // 1. If touch is OFF → reset sliding state
     if (!touched) {
         sliding[finger] = false;
         slideStartTime[finger] = 0;
+
+        // If this finger was active, release it
+        if (activeSliderFinger == finger) {
+            activeSliderFinger = -1;
+        }
+
         return false;
     }
 
@@ -236,40 +258,53 @@ bool detectSlider(int finger, bool touched, float gx, unsigned long now) {
     // 3. Use GYRO X as sliding axis
     float motion = gx;
 
+    // special case for thumb
+    if (finger == 0) motion = -gx; 
+
     // 4. Ignore tiny jitter
     if (abs(motion) < SLIDE_GYRO_DEADZONE) {
         if (sliding[finger] &&
             now - lastSlideMotion[finger] > SLIDE_IDLE_CUTOFF) {
 
             sliding[finger] = false;
-            Serial.print(fingerName[finger]);
-            Serial.println(" SLIDE END");
+            if (activeSliderFinger == finger) activeSliderFinger = -1;
         }
         return sliding[finger];
     }
-    
+
     // 5. Motion detected
     lastSlideMotion[finger] = now;
 
     // SLIDE START
     if (!sliding[finger]) {
         sliding[finger] = true;
-        Serial.print(fingerName[finger]);
-        Serial.println(" SLIDE START");
+        activeSliderFinger = finger;
+
+        // Reset slider value to 0 at the start
+           sliderValue[finger] = 0.0;
+           prevSliderValue[finger] = 0.0;
+        // Serial.print(fingerName[finger]);
+        // Serial.println(" SLIDE START");
     }
 
     // 6. Integrate slider movement
-    sliderValue[finger] += motion * SLIDE_GAIN * dt * 1000.0; // scaled
+    smoothedMotion[finger] = smoothedMotion[finger] + SLIDE_SMOOTHING * (motion - smoothedMotion[finger]);
+    sliderValue[finger] += smoothedMotion[finger] * SLIDE_GAIN * dt * 1000.0;
 
     // Clamp slider between 0 and 100
     sliderValue[finger] = constrain(sliderValue[finger], 0, 100);
 
-    Serial.print(fingerName[finger]);
-    Serial.print(" SLIDER: ");
-    Serial.println(sliderValue[finger]);
+    // Only print if slider value actually changed
+    if (sliderValue[finger] != prevSliderValue[finger]) {
+        sliderPrintCounter[finger]++; 
+        if (sliderPrintCounter[finger] >= 3) {
+            Serial.print(fingerName[finger]);
+            Serial.print(" SLIDER: ");
+            Serial.println(sliderValue[finger], 2);  // 2 decimal places
+            sliderPrintCounter[finger] = 0; 
+        }
+        prevSliderValue[finger] = sliderValue[finger];
+    }
 
     return true;
 }
-
-
-
