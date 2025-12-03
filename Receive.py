@@ -14,6 +14,7 @@ import random
 
 HOST = '127.0.0.1'
 PORT = 5001
+ser = None 
 
 BAUD_RATE = 115200
 latest_color = None
@@ -83,7 +84,7 @@ def find_usb_serial_port():
     return None
 
 def read_serial():
-    global index_slider_value, running, touch_state, current_mode
+    global index_slider_value, running, touch_state, current_mode, ser
     SERIAL_PORT = find_usb_serial_port()
     if SERIAL_PORT is None:
         return
@@ -614,6 +615,14 @@ def check_task_completion(contact_info):
 
     return False
 
+def send_haptic():
+    global ser
+    try:
+        ser.write(b'BUZZ\n')   # or any command you want
+    except:
+        print("Could not send fail haptic feedback")
+
+
 # ---------------- Main -----------------
 def main():
     global running, task_completed, task_active, current_mode, task_counter
@@ -716,6 +725,9 @@ def main():
 
             # ---------------- Simon Says Mode ----------------
             elif current_mode == MODE_SIMON:
+                if not task_completed and time.time() - task_start_time > SIMON_SAYS_DURATION:
+                    send_haptic()
+
                 if not task_active or time.time() - task_start_time > SIMON_SAYS_DURATION:
                     start_new_task()
 
@@ -769,8 +781,6 @@ def main():
             if cv2.waitKey(1) & 0xFF == 27:
                 running = False
                 break
-
-
 
     finally:
         running = False
